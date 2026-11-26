@@ -1,0 +1,2303 @@
+--[[
+    Velour UI Library
+    Crimson-Obsidian Procedural Silk Engine for Roblox Luau
+    Compatible with PC & Mobile (Touch + Mouse) / Delta Executor
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+
+--------------------------------------------------------------------------------
+-- Palette & Metrics
+--------------------------------------------------------------------------------
+
+local Theme = {
+    Obsidian      = Color3.fromRGB(8, 5, 7),
+    Velvet        = Color3.fromRGB(16, 7, 10),
+    Oxblood       = Color3.fromRGB(46, 7, 15),
+    Crimson       = Color3.fromRGB(132, 14, 34),
+    Scarlet       = Color3.fromRGB(198, 28, 56),
+    SilkGlint     = Color3.fromRGB(238, 92, 114),
+
+    Surface       = Color3.fromRGB(14, 9, 12),
+    SurfaceRaised = Color3.fromRGB(22, 13, 17),
+    SurfaceHover  = Color3.fromRGB(30, 16, 22),
+    ControlBg     = Color3.fromRGB(18, 11, 15),
+    Border        = Color3.fromRGB(58, 22, 31),
+    BorderFocus   = Color3.fromRGB(186, 32, 58),
+
+    TextPrimary   = Color3.fromRGB(242, 234, 236),
+    TextSecondary = Color3.fromRGB(168, 146, 152),
+    TextMuted     = Color3.fromRGB(112, 92, 99),
+}
+
+local FontFace = {
+    Heading = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Bold),
+    Semi    = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.SemiBold),
+    Body    = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Medium),
+    Mono    = Font.new("rbxasset://fonts/families/RobotoMono.json", Enum.FontWeight.Medium),
+}
+
+--------------------------------------------------------------------------------
+-- Utilities: Maid, Signal, Spring, Instance Builder
+--------------------------------------------------------------------------------
+
+local function getSafeParent()
+    if type(gethui) == "function" then
+        local ok, ui = pcall(gethui)
+        if ok and ui then
+            return ui
+        end
+    end
+    local ok, cg = pcall(function()
+        return CoreGui
+    end)
+    if ok and cg then
+        return cg
+    end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local function create(className, props, children)
+    local inst = Instance.new(className)
+    if props then
+        for k, v in pairs(props) do
+            if k ~= "Parent" then
+                inst[k] = v
+            end
+        end
+    end
+    if children then
+        for _, child in ipairs(children) do
+            child.Parent = inst
+        end
+    end
+    if props and props.Parent then
+        inst.Parent = props.Parent
+    end
+    return inst
+end
+
+local function clamp(x, lo, hi)
+    if x < lo then return lo end
+    if x > hi then return hi end
+    return x
+end
+
+local function lerp(a, b, t)
+    return a + (b - a) * t
+end
+
+local function smoothstep(edge0, edge1, x)
+    local t = clamp((x - edge0) / (edge1 - edge0), 0, 1)
+    return t * t * (3 - 2 * t)
+end
+
+local function tween(obj, duration, props, style, dir)
+    local t = TweenService:Create(
+        obj,
+        TweenInfo.new(duration, style or Enum.EasingStyle.Quint, dir or Enum.EasingDirection.Out),
+        props
+    )
+    t:Play()
+    return t
+end
+
+-- Maid: deterministic cleanup for connections, instances, and callbacks
+local Maid = {}
+Maid.__index = Maid
+
+function Maid.new()
+    return setmetatable({ _tasks = {} }, Maid)
+end
+
+function Maid:Give(taskItem)
+    table.insert(self._tasks, taskItem)
+    return taskItem
+end
+
+function Maid:Clean()
+    for i = #self._tasks, 1, -1 do
+        local item = self._tasks[i]
+        self._tasks[i] = nil
+        local t = typeof(item)
+        if t == "RBXScriptConnection" then
+            item:Disconnect()
+        elseif t == "Instance" then
+            item:Destroy()
+        elseif t == "function" then
+            pcall(item)
+        elseif type(item) == "table" and type(item.Destroy) == "function" then
+            pcall(item.Destroy, item)
+        end
+    end
+end
+
+-- Spring: critically/under-damped harmonic oscillator for organic UI motion
+local Spring = {}
+Spring.__index = Spring
+
+function Spring.new(initial, stiffness, damping)
+    return setmetatable({
+        Position = initial or 0,
+        Target = initial or 0,
+        Velocity = 0,
+        Stiffness = stiffness or 220,
+        Damping = damping or 22,
+    }, Spring)
+end
+
+function Spring:Step(dt)
+    local stepDt = math.min(dt, 1 / 30)
+    local force = (self.Target - self.Position) * self.Stiffness
+    local damp = self.Velocity * self.Damping
+    self.Velocity = self.Velocity + (force - damp) * stepDt
+    self.Position = self.Position + self.Velocity * stepDt
+    return self.Position
+end
+
+--------------------------------------------------------------------------------
+-- Procedural Silk Surface Engine
+-- Translates multi-octave drift, localized hover crease, and 3-slot Gaussian
+-- cosine pulse ripples into real-time Roblox UI layers.
+--------------------------------------------------------------------------------
+
+local SilkSurface = {}
+SilkSurface.__index = SilkSurface
+
+local MAX_PULSES = 3
+local FOLD_COUNT = 7
+
+local function silkNoise2D(x, y, t)
+    local a = math.sin(x * 1.35 + t * 0.62) * math.cos(y * 1.15 - t * 0.48)
+    local b = math.sin((x + y) * 2.1 - t * 0.94 + a * 0.85) * 0.5
+    local c = math.cos((x * 1.7 - y * 2.4) + t * 1.28 + b * 0.6) * 0.25
+    return (a + b + c) / 1.75
+end
+
+function SilkSurface.new(hostFrame, maid, cornerRadius)
+    local self = setmetatable({
+        Host = hostFrame,
+        Maid = maid,
+        Time = 0,
+        HoverTarget = Vector2.new(0.5, 0.5),
+        HoverCurrent = Vector2.new(0.5, 0.5),
+        HoverEnergy = 0,
+        HoverActive = false,
+        Pulses = {},
+        PulseCursor = 1,
+        Folds = {},
+        RippleRings = {},
+        Active = true,
+    }, SilkSurface)
+
+    for i = 1, MAX_PULSES do
+        self.Pulses[i] = { x = 0.5, y = 0.5, age = 10, strength = 0 }
+    end
+
+    -- Clipped backdrop container so silk folds never bleed outside rounded corners
+    local backdrop = create("Frame", {
+        Name = "SilkBackdrop",
+        Size = UDim2.fromScale(1, 1),
+        BackgroundColor3 = Theme.Obsidian,
+        BorderSizePixel = 0,
+        ClipsDescendants = true,
+        ZIndex = 1,
+        Parent = hostFrame,
+    }, {
+        create("UICorner", { CornerRadius = UDim.new(0, cornerRadius or 14) }),
+    })
+    self.Backdrop = backdrop
+
+    -- Base red-black flowing silk gradient
+    self.BaseGradient = create("UIGradient", {
+        Rotation = 28,
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0.00, Theme.Obsidian),
+            ColorSequenceKeypoint.new(0.32, Theme.Oxblood),
+            ColorSequenceKeypoint.new(0.55, Theme.Crimson),
+            ColorSequenceKeypoint.new(0.78, Theme.Velvet),
+            ColorSequenceKeypoint.new(1.00, Theme.Obsidian),
+        }),
+        Parent = backdrop,
+    })
+
+    -- Multi-band silk folds that glide like smoothing crimson-black cloth
+    for i = 1, FOLD_COUNT do
+        local frac = (i - 1) / (FOLD_COUNT - 1)
+        local isHighlight = (i % 2 == 0)
+        local band = create("Frame", {
+            Name = "SilkFold_" .. i,
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0.5, frac),
+            Size = UDim2.fromScale(1.65, 0.34 + (i % 3) * 0.08),
+            BackgroundColor3 = isHighlight and Theme.Scarlet or Theme.Crimson,
+            BackgroundTransparency = 0.78,
+            BorderSizePixel = 0,
+            Rotation = -14 + frac * 18,
+            ZIndex = 2,
+            Parent = backdrop,
+        })
+
+        local grad = create("UIGradient", {
+            Rotation = 90,
+            Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0.00, Theme.Obsidian),
+                ColorSequenceKeypoint.new(0.36, isHighlight and Theme.Crimson or Theme.Oxblood),
+                ColorSequenceKeypoint.new(0.50, isHighlight and Theme.SilkGlint or Theme.Scarlet),
+                ColorSequenceKeypoint.new(0.64, isHighlight and Theme.Crimson or Theme.Oxblood),
+                ColorSequenceKeypoint.new(1.00, Theme.Obsidian),
+            }),
+            Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0.00, 1.00),
+                NumberSequenceKeypoint.new(0.28, 0.86),
+                NumberSequenceKeypoint.new(0.50, isHighlight and 0.68 or 0.74),
+                NumberSequenceKeypoint.new(0.72, 0.86),
+                NumberSequenceKeypoint.new(1.00, 1.00),
+            }),
+            Parent = band,
+        })
+
+        self.Folds[i] = {
+            Frame = band,
+            Gradient = grad,
+            BaseY = 0.08 + frac * 0.84,
+            BaseRot = -16 + frac * 22,
+            Phase = i * 1.17,
+            Speed = 0.42 + (i % 3) * 0.14,
+            Highlight = isHighlight,
+        }
+    end
+
+    -- Localized hover sheen (tracks finger / cursor pressing into the silk)
+    self.HoverSheen = create("Frame", {
+        Name = "SilkHoverSheen",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(220, 220),
+        BackgroundColor3 = Theme.Scarlet,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ZIndex = 3,
+        Parent = backdrop,
+    }, {
+        create("UICorner", { CornerRadius = UDim.new(1, 0) }),
+        create("UIGradient", {
+            Rotation = 45,
+            Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Theme.SilkGlint),
+                ColorSequenceKeypoint.new(0.5, Theme.Crimson),
+                ColorSequenceKeypoint.new(1, Theme.Obsidian),
+            }),
+            Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0.35),
+                NumberSequenceKeypoint.new(0.55, 0.75),
+                NumberSequenceKeypoint.new(1, 1),
+            }),
+        }),
+    })
+
+    -- Expanding crease ripple waves (3 concurrent pulse slots matching shader)
+    for i = 1, MAX_PULSES do
+        local ring = create("Frame", {
+            Name = "SilkRipple_" .. i,
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0.5, 0.5),
+            Size = UDim2.fromOffset(0, 0),
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Visible = false,
+            ZIndex = 4,
+            Parent = backdrop,
+        }, {
+            create("UICorner", { CornerRadius = UDim.new(1, 0) }),
+        })
+
+        local stroke = create("UIStroke", {
+            Color = Theme.SilkGlint,
+            Thickness = 2.4,
+            Transparency = 1,
+            Parent = ring,
+        })
+
+        local ringGrad = create("UIGradient", {
+            Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0.0, Theme.SilkGlint),
+                ColorSequenceKeypoint.new(0.5, Theme.Crimson),
+                ColorSequenceKeypoint.new(1.0, Theme.Oxblood),
+            }),
+            Parent = stroke,
+        })
+
+        -- Secondary softer trailing crease echo
+        local echo = create("Frame", {
+            Name = "SilkEcho_" .. i,
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0.5, 0.5),
+            Size = UDim2.fromOffset(0, 0),
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Visible = false,
+            ZIndex = 3,
+            Parent = backdrop,
+        }, {
+            create("UICorner", { CornerRadius = UDim.new(1, 0) }),
+        })
+
+        local echoStroke = create("UIStroke", {
+            Color = Theme.Scarlet,
+            Thickness = 6,
+            Transparency = 1,
+            Parent = echo,
+        })
+
+        self.RippleRings[i] = {
+            Ring = ring,
+            Stroke = stroke,
+            Grad = ringGrad,
+            Echo = echo,
+            EchoStroke = echoStroke,
+        }
+    end
+
+    -- Edge vignette overlay for depth and text legibility
+    create("Frame", {
+        Name = "SilkVignette",
+        Size = UDim2.fromScale(1, 1),
+        BackgroundColor3 = Theme.Obsidian,
+        BackgroundTransparency = 0.28,
+        BorderSizePixel = 0,
+        ZIndex = 5,
+        Parent = backdrop,
+    }, {
+        create("UIGradient", {
+            Rotation = 90,
+            Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0.00, 0.42),
+                NumberSequenceKeypoint.new(0.22, 0.68),
+                NumberSequenceKeypoint.new(0.75, 0.58),
+                NumberSequenceKeypoint.new(1.00, 0.18),
+            }),
+        }),
+    })
+
+    -- Rim border that catches crimson light near the pointer
+    self.RimStroke = create("UIStroke", {
+        Color = Color3.new(1, 1, 1),
+        Thickness = 1.25,
+        Transparency = 0.25,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+        Parent = hostFrame,
+    })
+
+    self.RimGradient = create("UIGradient", {
+        Rotation = 25,
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0.00, Theme.Border),
+            ColorSequenceKeypoint.new(0.35, Theme.Crimson),
+            ColorSequenceKeypoint.new(0.50, Theme.SilkGlint),
+            ColorSequenceKeypoint.new(0.65, Theme.Crimson),
+            ColorSequenceKeypoint.new(1.00, Theme.Border),
+        }),
+        Parent = self.RimStroke,
+    })
+
+    self:_bindInput()
+    self:_startLoop()
+
+    return self
+end
+
+function SilkSurface:_toLocalNormalized(screenPos)
+    local absPos = self.Host.AbsolutePosition
+    local absSize = self.Host.AbsoluteSize
+    if absSize.X <= 1 or absSize.Y <= 1 then
+        return 0.5, 0.5, false
+    end
+    local nx = (screenPos.X - absPos.X) / absSize.X
+    local ny = (screenPos.Y - absPos.Y) / absSize.Y
+    local inside = nx >= 0 and nx <= 1 and ny >= 0 and ny <= 1
+    return clamp(nx, 0, 1), clamp(ny, 0, 1), inside
+end
+
+function SilkSurface:TriggerPulse(screenPos, strength)
+    local nx, ny = 0.5, 0.5
+    if screenPos then
+        nx, ny = self:_toLocalNormalized(screenPos)
+    end
+    local slot = self.Pulses[self.PulseCursor]
+    slot.x = nx
+    slot.y = ny
+    slot.age = 0
+    slot.strength = strength or 1.0
+    self.PulseCursor = (self.PulseCursor % MAX_PULSES) + 1
+end
+
+function SilkSurface:_bindInput()
+    self.Maid:Give(UserInputService.InputChanged:Connect(function(input)
+        if not self.Active or not self.Host.Visible then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            local nx, ny, inside = self:_toLocalNormalized(input.Position)
+            self.HoverActive = inside
+            if inside then
+                self.HoverTarget = Vector2.new(nx, ny)
+            end
+        end
+    end))
+
+    self.Maid:Give(UserInputService.InputBegan:Connect(function(input)
+        if not self.Active or not self.Host.Visible then return end
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            local nx, ny, inside = self:_toLocalNormalized(input.Position)
+            if inside then
+                self.HoverActive = true
+                self.HoverTarget = Vector2.new(nx, ny)
+                self:TriggerPulse(input.Position, 1.0)
+            end
+        end
+    end))
+end
+
+function SilkSurface:_startLoop()
+    self.Maid:Give(RunService.RenderStepped:Connect(function(dt)
+        if not self.Active or not self.Host.Visible then return end
+        local clampedDt = math.min(dt, 0.05)
+        self.Time = self.Time + clampedDt
+
+        -- Smoothly track pointer & hover heat
+        local trackRate = 1 - math.exp(-clampedDt * 9)
+        self.HoverCurrent = self.HoverCurrent:Lerp(self.HoverTarget, trackRate)
+        local targetEnergy = self.HoverActive and 1 or 0
+        self.HoverEnergy = lerp(self.HoverEnergy, targetEnergy, 1 - math.exp(-clampedDt * 6))
+
+        local t = self.Time
+        local absSize = self.Host.AbsoluteSize
+        local maxDim = math.max(absSize.X, absSize.Y, 200)
+
+        -- Advance active ripple pulses
+        for i = 1, MAX_PULSES do
+            local p = self.Pulses[i]
+            if p.strength > 0 then
+                p.age = p.age + clampedDt
+                if p.age > 1.35 then
+                    p.strength = 0
+                end
+            end
+        end
+
+        -- 1. Base silk sweep (slowly smoothing crimson-black fabric)
+        local sweepA = 0.24 + 0.14 * math.sin(t * 0.45) + (self.HoverCurrent.X - 0.5) * 0.08 * self.HoverEnergy
+        local sweepB = 0.52 + 0.16 * math.sin(t * 0.38 + 1.4) + (self.HoverCurrent.Y - 0.5) * 0.08 * self.HoverEnergy
+        local sweepC = 0.80 + 0.09 * math.cos(t * 0.31 + 0.6)
+
+        local k1 = clamp(sweepA, 0.10, 0.38)
+        local k2 = clamp(sweepB, k1 + 0.08, 0.72)
+        local k3 = clamp(sweepC, k2 + 0.08, 0.92)
+
+        self.BaseGradient.Rotation = 24 + math.sin(t * 0.28) * 14 + (self.HoverCurrent.X - 0.5) * 18 * self.HoverEnergy
+        self.BaseGradient.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0.00, Theme.Obsidian),
+            ColorSequenceKeypoint.new(k1, Theme.Oxblood),
+            ColorSequenceKeypoint.new(k2, Theme.Crimson),
+            ColorSequenceKeypoint.new(k3, Theme.Velvet),
+            ColorSequenceKeypoint.new(1.00, Theme.Obsidian),
+        })
+
+        -- 2. Silk fold ribbons: organic drift + pointer wrinkle + Gaussian ripple push
+        for i = 1, FOLD_COUNT do
+            local fold = self.Folds[i]
+            local drift = silkNoise2D(fold.Phase * 0.6, fold.BaseY * 2.2, t * fold.Speed)
+            local dy = drift * 0.055
+            local drot = drift * 6.5
+
+            -- Localized hover crease pull toward pointer
+            local distY = fold.BaseY - self.HoverCurrent.Y
+            local hoverInfluence = math.exp(-(distY * distY) / 0.065) * self.HoverEnergy
+            local creasePush = -distY * 0.11 * hoverInfluence
+            local creaseTilt = (self.HoverCurrent.X - 0.5) * 14 * hoverInfluence
+
+            -- Ripple wave front perturbation (matching shader ripple() formula)
+            local ripplePush = 0
+            local rippleSurge = 0
+            for j = 1, MAX_PULSES do
+                local pulse = self.Pulses[j]
+                if pulse.strength > 0 then
+                    local pd = math.abs(fold.BaseY - pulse.y)
+                    local front = (pd - pulse.age * 0.85) / 0.12
+                    local env = math.exp(-(front * front)) * pulse.strength * math.exp(-pulse.age * 1.7)
+                    local sign = (fold.BaseY >= pulse.y) and 1 or -1
+                    ripplePush = ripplePush + sign * env * math.cos(front * 2.2) * 0.065
+                    rippleSurge = rippleSurge + env
+                end
+            end
+
+            fold.Frame.Position = UDim2.fromScale(
+                0.5 + math.sin(t * 0.35 + fold.Phase) * 0.08,
+                clamp(fold.BaseY + dy + creasePush + ripplePush, -0.1, 1.1)
+            )
+            fold.Frame.Rotation = fold.BaseRot + drot + creaseTilt + ripplePush * 95
+            fold.Gradient.Offset = Vector2.new(
+                math.sin(t * 0.4 + fold.Phase) * 0.15,
+                math.cos(t * 0.32 + fold.Phase) * 0.12
+            )
+
+            local baseTrans = fold.Highlight and 0.72 or 0.78
+            local boost = hoverInfluence * 0.14 + rippleSurge * 0.24
+            fold.Frame.BackgroundTransparency = clamp(baseTrans - boost, 0.38, 0.92)
+        end
+
+        -- 3. Hover sheen spotlight
+        self.HoverSheen.Position = UDim2.fromScale(self.HoverCurrent.X, self.HoverCurrent.Y)
+        self.HoverSheen.BackgroundTransparency = lerp(1.0, 0.78, self.HoverEnergy)
+
+        -- 4. Expanding silk crease rings
+        for i = 1, MAX_PULSES do
+            local pulse = self.Pulses[i]
+            local visual = self.RippleRings[i]
+            if pulse.strength > 0 then
+                local progress = clamp(pulse.age / 1.15, 0, 1)
+                local eased = 1 - math.pow(1 - progress, 3)
+                local radius = eased * maxDim * 0.95
+                local fade = math.exp(-pulse.age * 2.4) * smoothstep(0.0, 0.08, pulse.age)
+
+                visual.Ring.Visible = true
+                visual.Ring.Position = UDim2.fromScale(pulse.x, pulse.y)
+                visual.Ring.Size = UDim2.fromOffset(radius * 1.25, radius * 0.92)
+                visual.Ring.Rotation = 18 + pulse.age * 16
+                visual.Stroke.Thickness = lerp(3.0, 0.8, eased)
+                visual.Stroke.Transparency = clamp(1 - fade * 0.78, 0.15, 1)
+                visual.Grad.Rotation = (t * 70 + i * 90) % 360
+
+                local echoRadius = math.max(0, (eased - 0.10)) * maxDim * 0.88
+                visual.Echo.Visible = echoRadius > 4
+                visual.Echo.Position = UDim2.fromScale(pulse.x, pulse.y)
+                visual.Echo.Size = UDim2.fromOffset(echoRadius * 1.25, echoRadius * 0.92)
+                visual.Echo.Rotation = 18 + pulse.age * 16
+                visual.EchoStroke.Transparency = clamp(1 - fade * 0.34, 0.55, 1)
+            else
+                visual.Ring.Visible = false
+                visual.Echo.Visible = false
+            end
+        end
+
+        -- 5. Rim border light sweep
+        local rimAngle = (t * 22 + self.HoverCurrent.X * 140) % 360
+        self.RimGradient.Rotation = rimAngle
+        self.RimStroke.Transparency = lerp(0.36, 0.12, self.HoverEnergy)
+    end))
+end
+
+--------------------------------------------------------------------------------
+-- Velour Library Core
+--------------------------------------------------------------------------------
+
+local Velour = {
+    Version = "1.0.0",
+    Flags = {},
+}
+Velour.__index = Velour
+
+local function attachDrag(handle, target, onTap)
+    local dragging = false
+    local dragStart, startPos
+    local moved = false
+
+    local conns = {}
+    table.insert(conns, handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            moved = false
+            dragStart = input.Position
+            startPos = target.Position
+        end
+    end))
+
+    table.insert(conns, UserInputService.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            local delta = input.Position - dragStart
+            if delta.Magnitude > 5 then
+                moved = true
+            end
+            if moved then
+                target.Position = UDim2.new(
+                    startPos.X.Scale,
+                    startPos.X.Offset + delta.X,
+                    startPos.Y.Scale,
+                    startPos.Y.Offset + delta.Y
+                )
+            end
+        end
+    end))
+
+    table.insert(conns, UserInputService.InputEnded:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+            if not moved and onTap then
+                onTap(input.Position)
+            end
+        end
+    end))
+
+    return function()
+        for _, c in ipairs(conns) do
+            c:Disconnect()
+        end
+    end
+end
+
+function Velour:CreateWindow(options)
+    options = options or {}
+    local title = options.Title or "VELOUR"
+    local subtitle = options.Subtitle or "SILK INTERFACE"
+    local toggleKey = options.ToggleKey or Enum.KeyCode.RightShift
+    local size = options.Size or UDim2.fromOffset(600, 410)
+
+    -- Clean any previous Velour instance on re-execute
+    local env = (type(getgenv) == "function" and getgenv()) or _G
+    if type(env._VelourActiveDestroy) == "function" then
+        pcall(env._VelourActiveDestroy)
+    end
+
+    local parentGui = getSafeParent()
+    local existing = parentGui:FindFirstChild("VelourScreenGui")
+    if existing then
+        existing:Destroy()
+    end
+
+    local maid = Maid.new()
+
+    local screenGui = create("ScreenGui", {
+        Name = "VelourScreenGui",
+        ResetOnSpawn = false,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+        IgnoreGuiInset = true,
+        Parent = parentGui,
+    })
+    maid:Give(screenGui)
+
+    -- Adapt window dimensions to smaller mobile viewports automatically
+    local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280, 720)
+    local targetW = math.min(size.X.Offset, math.floor(viewport.X * 0.92))
+    local targetH = math.min(size.Y.Offset, math.floor(viewport.Y * 0.84))
+    local finalSize = UDim2.fromOffset(targetW, targetH)
+
+    local main = create("Frame", {
+        Name = "VelourWindow",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(targetW * 0.94, targetH * 0.94),
+        BackgroundColor3 = Theme.Obsidian,
+        BackgroundTransparency = 0,
+        BorderSizePixel = 0,
+        ZIndex = 10,
+        Parent = screenGui,
+    }, {
+        create("UICorner", { CornerRadius = UDim.new(0, 14) }),
+    })
+
+    -- Soft ambient drop shadow
+    create("ImageLabel", {
+        Name = "Shadow",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.52),
+        Size = UDim2.new(1, 56, 1, 56),
+        BackgroundTransparency = 1,
+        Image = "rbxassetid://6015897843",
+        ImageColor3 = Color3.fromRGB(0, 0, 0),
+        ImageTransparency = 0.25,
+        ScaleType = Enum.ScaleType.Slice,
+        SliceCenter = Rect.new(49, 49, 450, 450),
+        ZIndex = 0,
+        Parent = main,
+    })
+
+    local silk = SilkSurface.new(main, maid, 14)
+
+    -- Foreground chrome layer (above silk backdrop)
+    local chrome = create("Frame", {
+        Name = "Chrome",
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        ZIndex = 12,
+        Parent = main,
+    })
+
+    -- Top Editorial Header
+    local header = create("Frame", {
+        Name = "Header",
+        Size = UDim2.new(1, 0, 0, 50),
+        BackgroundColor3 = Theme.Obsidian,
+        BackgroundTransparency = 0.42,
+        BorderSizePixel = 0,
+        ZIndex = 14,
+        Parent = chrome,
+    }, {
+        create("UICorner", { CornerRadius = UDim.new(0, 14) }),
+        create("Frame", {
+            Name = "BottomMask",
+            Position = UDim2.new(0, 0, 1, -12),
+            Size = UDim2.new(1, 0, 0, 12),
+            BackgroundColor3 = Theme.Obsidian,
+            BackgroundTransparency = 0.42,
+            BorderSizePixel = 0,
+            ZIndex = 14,
+        }),
+        create("Frame", {
+            Name = "HeaderRule",
+            Position = UDim2.new(0, 16, 1, -1),
+            Size = UDim2.new(1, -32, 0, 1),
+            BackgroundColor3 = Theme.Border,
+            BackgroundTransparency = 0.25,
+            BorderSizePixel = 0,
+            ZIndex = 15,
+        }, {
+            create("UIGradient", {
+                Color = ColorSequence.new({
+                    ColorSequenceKeypoint.new(0, Theme.Obsidian),
+                    ColorSequenceKeypoint.new(0.25, Theme.Crimson),
+                    ColorSequenceKeypoint.new(0.75, Theme.Crimson),
+                    ColorSequenceKeypoint.new(1, Theme.Obsidian),
+                }),
+            }),
+        }),
+    })
+
+    -- Brand Emblem (minimal crimson silk diamond)
+    local emblem = create("Frame", {
+        Name = "Emblem",
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, 18, 0.5, 0),
+        Size = UDim2.fromOffset(10, 10),
+        Rotation = 45,
+        BackgroundColor3 = Theme.Scarlet,
+        BorderSizePixel = 0,
+        ZIndex = 16,
+        Parent = header,
+    }, {
+        create("UICorner", { CornerRadius = UDim.new(0, 2) }),
+        create("UIStroke", { Color = Theme.SilkGlint, Thickness = 1, Transparency = 0.35 }),
+    })
+
+    create("TextLabel", {
+        Name = "Title",
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, 38, 0.5, -6),
+        Size = UDim2.new(0, 220, 0, 18),
+        BackgroundTransparency = 1,
+        Text = string.upper(title),
+        TextColor3 = Theme.TextPrimary,
+        TextSize = 14,
+        FontFace = FontFace.Heading,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        ZIndex = 16,
+        Parent = header,
+    })
+
+    create("TextLabel", {
+        Name = "Subtitle",
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, 38, 0.5, 9),
+        Size = UDim2.new(0, 220, 0, 12),
+        BackgroundTransparency = 1,
+        Text = string.upper(subtitle),
+        TextColor3 = Theme.TextMuted,
+        TextSize = 9,
+        FontFace = FontFace.Mono,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        ZIndex = 16,
+        Parent = header,
+    })
+
+    -- Window action buttons (Minimize & Close)
+    local actionWrap = create("Frame", {
+        Name = "Actions",
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -14, 0.5, 0),
+        Size = UDim2.fromOffset(64, 26),
+        BackgroundTransparency = 1,
+        ZIndex = 16,
+        Parent = header,
+    }, {
+        create("UIListLayout", {
+            FillDirection = Enum.FillDirection.Horizontal,
+            HorizontalAlignment = Enum.HorizontalAlignment.Right,
+            VerticalAlignment = Enum.VerticalAlignment.Center,
+            Padding = UDim.new(0, 6),
+        }),
+    })
+
+    local function makeHeaderBtn(label, hoverColor)
+        local btn = create("TextButton", {
+            Size = UDim2.fromOffset(26, 26),
+            BackgroundColor3 = Theme.SurfaceRaised,
+            BackgroundTransparency = 0.3,
+            Text = label,
+            TextColor3 = Theme.TextSecondary,
+            TextSize = 13,
+            FontFace = FontFace.Semi,
+            AutoButtonColor = false,
+            ZIndex = 17,
+            Parent = actionWrap,
+        }, {
+            create("UICorner", { CornerRadius = UDim.new(0, 7) }),
+            create("UIStroke", { Color = Theme.Border, Thickness = 1, Transparency = 0.4 }),
+        })
+        btn.MouseEnter:Connect(function()
+            tween(btn, 0.18, { BackgroundColor3 = hoverColor, TextColor3 = Theme.TextPrimary })
+        end)
+        btn.MouseLeave:Connect(function()
+            tween(btn, 0.18, { BackgroundColor3 = Theme.SurfaceRaised, TextColor3 = Theme.TextSecondary })
+        end)
+        return btn
+    end
+
+    local minBtn = makeHeaderBtn("-", Theme.Oxblood)
+    local closeBtn = makeHeaderBtn("x", Theme.Crimson)
+
+    -- Horizontal Silk-Rail Tab Strip (distinct from left-sidebar menus)
+    local tabStrip = create("ScrollingFrame", {
+        Name = "TabStrip",
+        Position = UDim2.new(0, 14, 0, 56),
+        Size = UDim2.new(1, -28, 0, 36),
+        BackgroundColor3 = Theme.Obsidian,
+        BackgroundTransparency = 0.48,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 0,
+        ScrollingDirection = Enum.ScrollingDirection.X,
+        CanvasSize = UDim2.fromOffset(0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.X,
+        ZIndex = 14,
+        Parent = chrome,
+    }, {
+        create("UICorner", { CornerRadius = UDim.new(0, 9) }),
+        create("UIStroke", { Color = Theme.Border, Thickness = 1, Transparency = 0.45 }),
+        create("UIPadding", {
+            PaddingLeft = UDim.new(0, 5),
+            PaddingRight = UDim.new(0, 5),
+            PaddingTop = UDim.new(0, 4),
+            PaddingBottom = UDim.new(0, 4),
+        }),
+    })
+
+    local tabListContainer = create("Frame", {
+        Name = "TabButtons",
+        Size = UDim2.fromScale(0, 1),
+        AutomaticSize = Enum.AutomaticSize.X,
+        BackgroundTransparency = 1,
+        ZIndex = 15,
+        Parent = tabStrip,
+    }, {
+        create("UIListLayout", {
+            FillDirection = Enum.FillDirection.Horizontal,
+            VerticalAlignment = Enum.VerticalAlignment.Center,
+            Padding = UDim.new(0, 4),
+            SortOrder = Enum.SortOrder.LayoutOrder,
+        }),
+    })
+
+    -- Spring-driven crimson silk underline indicator
+    local tabIndicator = create("Frame", {
+        Name = "TabIndicator",
+        AnchorPoint = Vector2.new(0, 1),
+        Position = UDim2.new(0, 5, 1, -2),
+        Size = UDim2.fromOffset(0, 2),
+        BackgroundColor3 = Theme.Scarlet,
+        BorderSizePixel = 0,
+        ZIndex = 17,
+        Parent = tabStrip,
+    }, {
+        create("UICorner", { CornerRadius = UDim.new(1, 0) }),
+        create("UIGradient", {
+            Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Theme.Crimson),
+                ColorSequenceKeypoint.new(0.5, Theme.SilkGlint),
+                ColorSequenceKeypoint.new(1, Theme.Crimson),
+            }),
+        }),
+    })
+
+    -- Main Scrollable Content Viewport
+    local pageHolder = create("Frame", {
+        Name = "PageHolder",
+        Position = UDim2.new(0, 14, 0, 100),
+        Size = UDim2.new(1, -28, 1, -114),
+        BackgroundTransparency = 1,
+        ClipsDescendants = true,
+        ZIndex = 14,
+        Parent = chrome,
+    })
+
+    -- Floating Draggable Quick-Toggle Pill (Mobile + PC friendly)
+    local floatingPill = create("Frame", {
+        Name = "VelourTogglePill",
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, 18, 0.5, 0),
+        Size = UDim2.fromOffset(46, 46),
+        BackgroundColor3 = Theme.Obsidian,
+        BorderSizePixel = 0,
+        Visible = false,
+        ZIndex = 30,
+        Parent = screenGui,
+    }, {
+        create("UICorner", { CornerRadius = UDim.new(0, 13) }),
+        create("UIStroke", { Color = Theme.Crimson, Thickness = 1.5, Transparency = 0.15 }),
+        create("UIGradient", {
+            Rotation = 135,
+            Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Theme.Oxblood),
+                ColorSequenceKeypoint.new(0.5, Theme.Obsidian),
+                ColorSequenceKeypoint.new(1, Theme.Crimson),
+            }),
+        }),
+        create("TextLabel", {
+            Size = UDim2.fromScale(1, 1),
+            BackgroundTransparency = 1,
+            Text = string.sub(string.upper(title), 1, 1),
+            TextColor3 = Theme.TextPrimary,
+            TextSize = 18,
+            FontFace = FontFace.Heading,
+            ZIndex = 31,
+        }),
+    })
+
+    -- Notification Stack Container
+    local notifyStack = create("Frame", {
+        Name = "NotifyStack",
+        AnchorPoint = Vector2.new(1, 1),
+        Position = UDim2.new(1, -18, 1, -18),
+        Size = UDim2.new(0, 280, 1, -36),
+        BackgroundTransparency = 1,
+        ZIndex = 40,
+        Parent = screenGui,
+    }, {
+        create("UIListLayout", {
+            VerticalAlignment = Enum.VerticalAlignment.Bottom,
+            HorizontalAlignment = Enum.HorizontalAlignment.Right,
+            Padding = UDim.new(0, 8),
+            SortOrder = Enum.SortOrder.LayoutOrder,
+        }),
+    })
+
+    local window = {
+        ScreenGui = screenGui,
+        Main = main,
+        Silk = silk,
+        Maid = maid,
+        Tabs = {},
+        ActiveTab = nil,
+        Visible = true,
+        Destroyed = false,
+    }
+
+    -- Spring animation for tab indicator
+    local indX = Spring.new(5, 260, 24)
+    local indW = Spring.new(0, 260, 24)
+
+    maid:Give(RunService.RenderStepped:Connect(function(dt)
+        if not window.Visible or not window.ActiveTab then return end
+        local btn = window.ActiveTab.Button
+        if btn and btn.Parent then
+            indX.Target = btn.AbsolutePosition.X - tabStrip.AbsolutePosition.X + tabStrip.CanvasPosition.X + 4
+            indW.Target = math.max(0, btn.AbsoluteSize.X - 8)
+            tabIndicator.Position = UDim2.new(0, indX:Step(dt), 1, -2)
+            tabIndicator.Size = UDim2.fromOffset(indW:Step(dt), 2)
+        end
+    end))
+
+    function window:SetVisible(state)
+        if self.Destroyed then return end
+        self.Visible = state
+        if state then
+            main.Visible = true
+            floatingPill.Visible = false
+            silk.Active = true
+            main.Size = UDim2.fromOffset(targetW * 0.94, targetH * 0.94)
+            tween(main, 0.28, { Size = finalSize }, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+            silk:TriggerPulse(main.AbsolutePosition + main.AbsoluteSize * 0.5, 0.85)
+        else
+            silk.Active = false
+            local tw = tween(main, 0.18, { Size = UDim2.fromOffset(targetW * 0.92, targetH * 0.92) })
+            tw.Completed:Once(function()
+                if not self.Visible and not self.Destroyed then
+                    main.Visible = false
+                    floatingPill.Visible = true
+                end
+            end)
+        end
+    end
+
+    function window:Destroy()
+        if self.Destroyed then return end
+        self.Destroyed = true
+        silk.Active = false
+        maid:Clean()
+        if env._VelourActiveDestroy == self._destroyRef then
+            env._VelourActiveDestroy = nil
+        end
+    end
+    window._destroyRef = function()
+        window:Destroy()
+    end
+    env._VelourActiveDestroy = window._destroyRef
+
+    -- Wire dragging & window controls
+    maid:Give(attachDrag(header, main))
+    maid:Give(attachDrag(floatingPill, floatingPill, function()
+        window:SetVisible(true)
+    end))
+
+    minBtn.MouseButton1Click:Connect(function()
+        window:SetVisible(false)
+    end)
+
+    closeBtn.MouseButton1Click:Connect(function()
+        window:Destroy()
+    end)
+
+    maid:Give(UserInputService.InputBegan:Connect(function(input, gp)
+        if gp then return end
+        if input.KeyCode == toggleKey then
+            window:SetVisible(not window.Visible)
+        end
+    end))
+
+    -- Entrance animation
+    tween(main, 0.34, { Size = finalSize }, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+    task.defer(function()
+        if not window.Destroyed then
+            silk:TriggerPulse(main.AbsolutePosition + main.AbsoluteSize * 0.5, 0.9)
+        end
+    end)
+
+    ----------------------------------------------------------------------------
+    -- Notifications
+    ----------------------------------------------------------------------------
+
+    function window:Notify(cfg)
+        cfg = cfg or {}
+        local nTitle = cfg.Title or title
+        local nContent = cfg.Content or ""
+        local duration = cfg.Duration or 3.5
+
+        local card = create("Frame", {
+            Size = UDim2.new(1, 0, 0, 0),
+            AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundColor3 = Theme.Velvet,
+            BackgroundTransparency = 0.08,
+            BorderSizePixel = 0,
+            ClipsDescendants = true,
+            ZIndex = 41,
+            Parent = notifyStack,
+        }, {
+            create("UICorner", { CornerRadius = UDim.new(0, 10) }),
+            create("UIStroke", { Color = Theme.Crimson, Thickness = 1, Transparency = 0.2 }),
+            create("UIPadding", {
+                PaddingTop = UDim.new(0, 10),
+                PaddingBottom = UDim.new(0, 12),
+                PaddingLeft = UDim.new(0, 14),
+                PaddingRight = UDim.new(0, 12),
+            }),
+            create("UIListLayout", { Padding = UDim.new(0, 3) }),
+            create("TextLabel", {
+                Size = UDim2.new(1, 0, 0, 16),
+                BackgroundTransparency = 1,
+                Text = nTitle,
+                TextColor3 = Theme.TextPrimary,
+                TextSize = 12,
+                FontFace = FontFace.Semi,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                ZIndex = 42,
+            }),
+            create("TextLabel", {
+                Size = UDim2.new(1, 0, 0, 0),
+                AutomaticSize = Enum.AutomaticSize.Y,
+                BackgroundTransparency = 1,
+                Text = nContent,
+                TextColor3 = Theme.TextSecondary,
+                TextSize = 11,
+                FontFace = FontFace.Body,
+                TextWrapped = true,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                ZIndex = 42,
+            }),
+        })
+
+        local bar = create("Frame", {
+            AnchorPoint = Vector2.new(0, 1),
+            Position = UDim2.new(0, 0, 1, 0),
+            Size = UDim2.new(1, 0, 0, 2),
+            BackgroundColor3 = Theme.Scarlet,
+            BorderSizePixel = 0,
+            ZIndex = 43,
+            Parent = card,
+        })
+
+        tween(bar, duration, { Size = UDim2.new(0, 0, 0, 2) }, Enum.EasingStyle.Linear)
+        task.delay(duration, function()
+            if card and card.Parent then
+                local out = tween(card, 0.22, { BackgroundTransparency = 1 })
+                out.Completed:Once(function()
+                    if card then card:Destroy() end
+                end)
+            end
+        end)
+    end
+
+    ----------------------------------------------------------------------------
+    -- Tabs & Controls
+    ----------------------------------------------------------------------------
+
+    function window:AddTab(tabOptions)
+        tabOptions = type(tabOptions) == "string" and { Title = tabOptions } or (tabOptions or {})
+        local tabTitle = tabOptions.Title or ("Tab " .. (#self.Tabs + 1))
+
+        local tabBtn = create("TextButton", {
+            Name = "Tab_" .. tabTitle,
+            Size = UDim2.new(0, 0, 1, 0),
+            AutomaticSize = Enum.AutomaticSize.X,
+            BackgroundColor3 = Theme.SurfaceRaised,
+            BackgroundTransparency = 1,
+            Text = tabTitle,
+            TextColor3 = Theme.TextMuted,
+            TextSize = 12,
+            FontFace = FontFace.Semi,
+            AutoButtonColor = false,
+            LayoutOrder = #self.Tabs + 1,
+            ZIndex = 16,
+            Parent = tabListContainer,
+        }, {
+            create("UICorner", { CornerRadius = UDim.new(0, 6) }),
+            create("UIPadding", { PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12) }),
+        })
+
+        local page = create("ScrollingFrame", {
+            Name = "Page_" .. tabTitle,
+            Size = UDim2.fromScale(1, 1),
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            ScrollBarThickness = 3,
+            ScrollBarImageColor3 = Theme.Crimson,
+            ScrollBarImageTransparency = 0.35,
+            CanvasSize = UDim2.fromOffset(0, 0),
+            AutomaticCanvasSize = Enum.AutomaticSize.Y,
+            Visible = false,
+            ZIndex = 15,
+            Parent = pageHolder,
+        }, {
+            create("UIListLayout", {
+                Padding = UDim.new(0, 10),
+                SortOrder = Enum.SortOrder.LayoutOrder,
+            }),
+            create("UIPadding", {
+                PaddingTop = UDim.new(0, 2),
+                PaddingBottom = UDim.new(0, 10),
+                PaddingRight = UDim.new(0, 6),
+            }),
+        })
+
+        local tab = {
+            Title = tabTitle,
+            Button = tabBtn,
+            Page = page,
+            Order = 0,
+        }
+
+        local function selectTab()
+            if self.ActiveTab == tab then return end
+            for _, t in ipairs(self.Tabs) do
+                t.Page.Visible = false
+                tween(t.Button, 0.2, {
+                    BackgroundTransparency = 1,
+                    TextColor3 = Theme.TextMuted,
+                })
+            end
+            self.ActiveTab = tab
+            tab.Page.Visible = true
+            tab.Page.Position = UDim2.fromOffset(0, 8)
+            tween(tab.Page, 0.22, { Position = UDim2.fromOffset(0, 0) })
+            tween(tab.Button, 0.2, {
+                BackgroundTransparency = 0.55,
+                TextColor3 = Theme.TextPrimary,
+            })
+        end
+
+        tabBtn.MouseButton1Click:Connect(function()
+            selectTab()
+            silk:TriggerPulse(tabBtn.AbsolutePosition + tabBtn.AbsoluteSize * 0.5, 0.7)
+        end)
+
+        tabBtn.MouseEnter:Connect(function()
+            if self.ActiveTab ~= tab then
+                tween(tabBtn, 0.16, { TextColor3 = Theme.TextSecondary })
+            end
+        end)
+
+        tabBtn.MouseLeave:Connect(function()
+            if self.ActiveTab ~= tab then
+                tween(tabBtn, 0.16, { TextColor3 = Theme.TextMuted })
+            end
+        end)
+
+        table.insert(self.Tabs, tab)
+        if #self.Tabs == 1 then
+            selectTab()
+        end
+
+        ------------------------------------------------------------------------
+        -- Sections
+        ------------------------------------------------------------------------
+
+        function tab:AddSection(sectionTitle)
+            self.Order = self.Order + 1
+
+            local wrapper = create("Frame", {
+                Name = "Section_" .. (sectionTitle or self.Order),
+                Size = UDim2.new(1, 0, 0, 0),
+                AutomaticSize = Enum.AutomaticSize.Y,
+                BackgroundColor3 = Theme.Surface,
+                BackgroundTransparency = 0.34,
+                BorderSizePixel = 0,
+                LayoutOrder = self.Order,
+                ZIndex = 16,
+                Parent = page,
+            }, {
+                create("UICorner", { CornerRadius = UDim.new(0, 10) }),
+                create("UIStroke", { Color = Theme.Border, Thickness = 1, Transparency = 0.45 }),
+                create("UIPadding", {
+                    PaddingTop = UDim.new(0, 10),
+                    PaddingBottom = UDim.new(0, 10),
+                    PaddingLeft = UDim.new(0, 12),
+                    PaddingRight = UDim.new(0, 12),
+                }),
+                create("UIListLayout", {
+                    Padding = UDim.new(0, 6),
+                    SortOrder = Enum.SortOrder.LayoutOrder,
+                }),
+            })
+
+            if sectionTitle and sectionTitle ~= "" then
+                local head = create("Frame", {
+                    Size = UDim2.new(1, 0, 0, 20),
+                    BackgroundTransparency = 1,
+                    LayoutOrder = 0,
+                    ZIndex = 17,
+                    Parent = wrapper,
+                })
+                create("Frame", {
+                    AnchorPoint = Vector2.new(0, 0.5),
+                    Position = UDim2.new(0, 0, 0.5, 0),
+                    Size = UDim2.fromOffset(3, 12),
+                    BackgroundColor3 = Theme.Scarlet,
+                    BorderSizePixel = 0,
+                    ZIndex = 18,
+                    Parent = head,
+                }, {
+                    create("UICorner", { CornerRadius = UDim.new(1, 0) }),
+                })
+                create("TextLabel", {
+                    Position = UDim2.fromOffset(10, 0),
+                    Size = UDim2.new(1, -10, 1, 0),
+                    BackgroundTransparency = 1,
+                    Text = string.upper(sectionTitle),
+                    TextColor3 = Theme.TextSecondary,
+                    TextSize = 10,
+                    FontFace = FontFace.Mono,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    ZIndex = 18,
+                    Parent = head,
+                })
+            end
+
+            local section = {
+                Container = wrapper,
+                ItemOrder = 0,
+            }
+
+            local function nextOrder()
+                section.ItemOrder = section.ItemOrder + 1
+                return section.ItemOrder
+            end
+
+            local function makeRow(height)
+                local row = create("Frame", {
+                    Size = UDim2.new(1, 0, 0, height),
+                    BackgroundColor3 = Theme.ControlBg,
+                    BackgroundTransparency = 0.25,
+                    BorderSizePixel = 0,
+                    LayoutOrder = nextOrder(),
+                    ZIndex = 17,
+                    Parent = wrapper,
+                }, {
+                    create("UICorner", { CornerRadius = UDim.new(0, 8) }),
+                })
+                local stroke = create("UIStroke", {
+                    Color = Theme.Border,
+                    Thickness = 1,
+                    Transparency = 0.55,
+                    Parent = row,
+                })
+                return row, stroke
+            end
+
+            --------------------------------------------------------------------
+            -- Control: Toggle
+            --------------------------------------------------------------------
+
+            function section:AddToggle(cfg)
+                cfg = cfg or {}
+                local label = cfg.Title or "Toggle"
+                local desc = cfg.Description
+                local flag = cfg.Flag
+                local value = cfg.Default == true
+                local callback = cfg.Callback
+
+                local row, stroke = makeRow(desc and 48 or 38)
+
+                local hit = create("TextButton", {
+                    Size = UDim2.fromScale(1, 1),
+                    BackgroundTransparency = 1,
+                    Text = "",
+                    AutoButtonColor = false,
+                    ZIndex = 18,
+                    Parent = row,
+                })
+
+                create("TextLabel", {
+                    Position = UDim2.new(0, 12, 0, desc and 7 or 0),
+                    Size = UDim2.new(1, -68, 0, desc and 18 or 38),
+                    BackgroundTransparency = 1,
+                    Text = label,
+                    TextColor3 = Theme.TextPrimary,
+                    TextSize = 12,
+                    FontFace = FontFace.Body,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    ZIndex = 18,
+                    Parent = row,
+                })
+
+                if desc then
+                    create("TextLabel", {
+                        Position = UDim2.new(0, 12, 0, 25),
+                        Size = UDim2.new(1, -68, 0, 15),
+                        BackgroundTransparency = 1,
+                        Text = desc,
+                        TextColor3 = Theme.TextMuted,
+                        TextSize = 10,
+                        FontFace = FontFace.Body,
+                        TextXAlignment = Enum.TextXAlignment.Left,
+                        ZIndex = 18,
+                        Parent = row,
+                    })
+                end
+
+                local track = create("Frame", {
+                    AnchorPoint = Vector2.new(1, 0.5),
+                    Position = UDim2.new(1, -12, 0.5, 0),
+                    Size = UDim2.fromOffset(38, 20),
+                    BackgroundColor3 = Theme.SurfaceRaised,
+                    BorderSizePixel = 0,
+                    ZIndex = 18,
+                    Parent = row,
+                }, {
+                    create("UICorner", { CornerRadius = UDim.new(1, 0) }),
+                })
+                local trackStroke = create("UIStroke", {
+                    Color = Theme.Border,
+                    Thickness = 1,
+                    Transparency = 0.2,
+                    Parent = track,
+                })
+
+                local knob = create("Frame", {
+                    AnchorPoint = Vector2.new(0, 0.5),
+                    Position = UDim2.new(0, 3, 0.5, 0),
+                    Size = UDim2.fromOffset(14, 14),
+                    BackgroundColor3 = Theme.TextSecondary,
+                    BorderSizePixel = 0,
+                    ZIndex = 19,
+                    Parent = track,
+                }, {
+                    create("UICorner", { CornerRadius = UDim.new(1, 0) }),
+                })
+
+                local obj = {}
+
+                function obj:Set(newVal, silent)
+                    value = newVal == true
+                    if flag then Velour.Flags[flag] = value end
+                    if value then
+                        tween(track, 0.22, { BackgroundColor3 = Theme.Crimson })
+                        tween(trackStroke, 0.22, { Color = Theme.SilkGlint })
+                        tween(knob, 0.24, {
+                            Position = UDim2.new(1, -17, 0.5, 0),
+                            BackgroundColor3 = Theme.TextPrimary,
+                        }, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+                    else
+                        tween(track, 0.22, { BackgroundColor3 = Theme.SurfaceRaised })
+                        tween(trackStroke, 0.22, { Color = Theme.Border })
+                        tween(knob, 0.22, {
+                            Position = UDim2.new(0, 3, 0.5, 0),
+                            BackgroundColor3 = Theme.TextSecondary,
+                        })
+                    end
+                    if not silent and callback then
+                        task.spawn(callback, value)
+                    end
+                end
+
+                function obj:Get()
+                    return value
+                end
+
+                hit.MouseButton1Click:Connect(function()
+                    obj:Set(not value)
+                    silk:TriggerPulse(track.AbsolutePosition + track.AbsoluteSize * 0.5, 0.65)
+                end)
+
+                hit.MouseEnter:Connect(function()
+                    tween(row, 0.16, { BackgroundColor3 = Theme.SurfaceHover })
+                    tween(stroke, 0.16, { Transparency = 0.25 })
+                end)
+
+                hit.MouseLeave:Connect(function()
+                    tween(row, 0.16, { BackgroundColor3 = Theme.ControlBg })
+                    tween(stroke, 0.16, { Transparency = 0.55 })
+                end)
+
+                obj:Set(value, true)
+                return obj
+            end
+
+            --------------------------------------------------------------------
+            -- Control: Slider (Touch + Mouse)
+            --------------------------------------------------------------------
+
+            function section:AddSlider(cfg)
+                cfg = cfg or {}
+                local label = cfg.Title or "Slider"
+                local minV = cfg.Min or 0
+                local maxV = cfg.Max or 100
+                local step = cfg.Increment or 1
+                local suffix = cfg.Suffix or ""
+                local flag = cfg.Flag
+                local value = clamp(cfg.Default or minV, minV, maxV)
+                local callback = cfg.Callback
+
+                local row, stroke = makeRow(54)
+
+                create("TextLabel", {
+                    Position = UDim2.new(0, 12, 0, 8),
+                    Size = UDim2.new(1, -84, 0, 16),
+                    BackgroundTransparency = 1,
+                    Text = label,
+                    TextColor3 = Theme.TextPrimary,
+                    TextSize = 12,
+                    FontFace = FontFace.Body,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    ZIndex = 18,
+                    Parent = row,
+                })
+
+                local readout = create("TextLabel", {
+                    AnchorPoint = Vector2.new(1, 0),
+                    Position = UDim2.new(1, -12, 0, 8),
+                    Size = UDim2.fromOffset(66, 16),
+                    BackgroundTransparency = 1,
+                    Text = tostring(value) .. suffix,
+                    TextColor3 = Theme.SilkGlint,
+                    TextSize = 11,
+                    FontFace = FontFace.Mono,
+                    TextXAlignment = Enum.TextXAlignment.Right,
+                    ZIndex = 18,
+                    Parent = row,
+                })
+
+                local barHit = create("TextButton", {
+                    Position = UDim2.new(0, 12, 0, 29),
+                    Size = UDim2.new(1, -24, 0, 18),
+                    BackgroundTransparency = 1,
+                    Text = "",
+                    AutoButtonColor = false,
+                    ZIndex = 19,
+                    Parent = row,
+                })
+
+                local barBg = create("Frame", {
+                    AnchorPoint = Vector2.new(0, 0.5),
+                    Position = UDim2.fromScale(0, 0.5),
+                    Size = UDim2.new(1, 0, 0, 5),
+                    BackgroundColor3 = Theme.SurfaceRaised,
+                    BorderSizePixel = 0,
+                    ZIndex = 18,
+                    Parent = barHit,
+                }, {
+                    create("UICorner", { CornerRadius = UDim.new(1, 0) }),
+                })
+
+                local barFill = create("Frame", {
+                    Size = UDim2.fromScale(0, 1),
+                    BackgroundColor3 = Theme.Scarlet,
+                    BorderSizePixel = 0,
+                    ZIndex = 19,
+                    Parent = barBg,
+                }, {
+                    create("UICorner", { CornerRadius = UDim.new(1, 0) }),
+                    create("UIGradient", {
+                        Color = ColorSequence.new({
+                            ColorSequenceKeypoint.new(0, Theme.Oxblood),
+                            ColorSequenceKeypoint.new(0.65, Theme.Crimson),
+                            ColorSequenceKeypoint.new(1, Theme.SilkGlint),
+                        }),
+                    }),
+                })
+
+                local thumb = create("Frame", {
+                    AnchorPoint = Vector2.new(0.5, 0.5),
+                    Position = UDim2.fromScale(1, 0.5),
+                    Size = UDim2.fromOffset(12, 12),
+                    BackgroundColor3 = Theme.TextPrimary,
+                    BorderSizePixel = 0,
+                    ZIndex = 20,
+                    Parent = barFill,
+                }, {
+                    create("UICorner", { CornerRadius = UDim.new(1, 0) }),
+                    create("UIStroke", { Color = Theme.Crimson, Thickness = 2 }),
+                })
+
+                local obj = {}
+                local dragging = false
+
+                local function formatNum(n)
+                    if step < 1 then
+                        local decimals = math.max(1, math.ceil(-math.log10(step)))
+                        return string.format("%." .. decimals .. "f", n)
+                    end
+                    return tostring(math.floor(n + 0.5))
+                end
+
+                function obj:Set(newVal, silent)
+                    local snapped = math.floor(((newVal - minV) / step) + 0.5) * step + minV
+                    value = clamp(snapped, minV, maxV)
+                    if flag then Velour.Flags[flag] = value end
+                    local pct = (maxV == minV) and 0 or (value - minV) / (maxV - minV)
+                    readout.Text = formatNum(value) .. suffix
+                    tween(barFill, 0.08, { Size = UDim2.fromScale(pct, 1) })
+                    if not silent and callback then
+                        task.spawn(callback, value)
+                    end
+                end
+
+                function obj:Get()
+                    return value
+                end
+
+                local function updateFromX(xPos)
+                    local rel = (xPos - barBg.AbsolutePosition.X) / math.max(barBg.AbsoluteSize.X, 1)
+                    obj:Set(minV + clamp(rel, 0, 1) * (maxV - minV))
+                end
+
+                barHit.InputBegan:Connect(function(input)
+                    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                        dragging = true
+                        tween(thumb, 0.12, { Size = UDim2.fromOffset(15, 15) })
+                        tween(stroke, 0.14, { Color = Theme.BorderFocus, Transparency = 0.2 })
+                        updateFromX(input.Position.X)
+                        silk:TriggerPulse(input.Position, 0.55)
+                    end
+                end)
+
+                maid:Give(UserInputService.InputChanged:Connect(function(input)
+                    if not dragging then return end
+                    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+                        updateFromX(input.Position.X)
+                    end
+                end))
+
+                maid:Give(UserInputService.InputEnded:Connect(function(input)
+                    if not dragging then return end
+                    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                        dragging = false
+                        tween(thumb, 0.14, { Size = UDim2.fromOffset(12, 12) })
+                        tween(stroke, 0.16, { Color = Theme.Border, Transparency = 0.55 })
+                    end
+                end))
+
+                obj:Set(value, true)
+                return obj
+            end
+
+            --------------------------------------------------------------------
+            -- Control: Button
+            --------------------------------------------------------------------
+
+            function section:AddButton(cfg)
+                cfg = cfg or {}
+                local label = cfg.Title or "Action"
+                local desc = cfg.Description
+                local badge = cfg.Badge or ">"
+                local callback = cfg.Callback
+
+                local row, stroke = makeRow(desc and 48 or 38)
+
+                local btn = create("TextButton", {
+                    Size = UDim2.fromScale(1, 1),
+                    BackgroundTransparency = 1,
+                    Text = "",
+                    AutoButtonColor = false,
+                    ZIndex = 18,
+                    Parent = row,
+                })
+
+                create("TextLabel", {
+                    Position = UDim2.new(0, 12, 0, desc and 7 or 0),
+                    Size = UDim2.new(1, -56, 0, desc and 18 or 38),
+                    BackgroundTransparency = 1,
+                    Text = label,
+                    TextColor3 = Theme.TextPrimary,
+                    TextSize = 12,
+                    FontFace = FontFace.Body,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    ZIndex = 18,
+                    Parent = row,
+                })
+
+                if desc then
+                    create("TextLabel", {
+                        Position = UDim2.new(0, 12, 0, 25),
+                        Size = UDim2.new(1, -56, 0, 15),
+                        BackgroundTransparency = 1,
+                        Text = desc,
+                        TextColor3 = Theme.TextMuted,
+                        TextSize = 10,
+                        FontFace = FontFace.Body,
+                        TextXAlignment = Enum.TextXAlignment.Left,
+                        ZIndex = 18,
+                        Parent = row,
+                    })
+                end
+
+                local pill = create("TextLabel", {
+                    AnchorPoint = Vector2.new(1, 0.5),
+                    Position = UDim2.new(1, -12, 0.5, 0),
+                    Size = UDim2.fromOffset(32, 20),
+                    BackgroundColor3 = Theme.Oxblood,
+                    BackgroundTransparency = 0.35,
+                    Text = badge,
+                    TextColor3 = Theme.SilkGlint,
+                    TextSize = 10,
+                    FontFace = FontFace.Mono,
+                    ZIndex = 18,
+                    Parent = row,
+                }, {
+                    create("UICorner", { CornerRadius = UDim.new(0, 5) }),
+                })
+
+                btn.MouseEnter:Connect(function()
+                    tween(row, 0.16, { BackgroundColor3 = Theme.SurfaceHover })
+                    tween(stroke, 0.16, { Color = Theme.BorderFocus, Transparency = 0.3 })
+                    tween(pill, 0.16, { BackgroundTransparency = 0.1 })
+                end)
+
+                btn.MouseLeave:Connect(function()
+                    tween(row, 0.16, { BackgroundColor3 = Theme.ControlBg })
+                    tween(stroke, 0.16, { Color = Theme.Border, Transparency = 0.55 })
+                    tween(pill, 0.16, { BackgroundTransparency = 0.35 })
+                end)
+
+                btn.MouseButton1Click:Connect(function()
+                    tween(row, 0.08, { BackgroundColor3 = Theme.Oxblood })
+                    task.delay(0.1, function()
+                        if row and row.Parent then
+                            tween(row, 0.18, { BackgroundColor3 = Theme.ControlBg })
+                        end
+                    end)
+                    silk:TriggerPulse(row.AbsolutePosition + row.AbsoluteSize * 0.5, 0.85)
+                    if callback then
+                        task.spawn(callback)
+                    end
+                end)
+
+                return row
+            end
+
+            --------------------------------------------------------------------
+            -- Control: Dropdown (Single & Multi-select)
+            --------------------------------------------------------------------
+
+            function section:AddDropdown(cfg)
+                cfg = cfg or {}
+                local label = cfg.Title or "Select"
+                local items = cfg.Values or {}
+                local multi = cfg.Multi == true
+                local flag = cfg.Flag
+                local callback = cfg.Callback
+
+                local selected = multi and {} or cfg.Default
+                if multi and type(cfg.Default) == "table" then
+                    for _, v in ipairs(cfg.Default) do
+                        selected[v] = true
+                    end
+                end
+
+                local holder = create("Frame", {
+                    Size = UDim2.new(1, 0, 0, 38),
+                    BackgroundColor3 = Theme.ControlBg,
+                    BackgroundTransparency = 0.25,
+                    BorderSizePixel = 0,
+                    ClipsDescendants = true,
+                    LayoutOrder = nextOrder(),
+                    ZIndex = 17,
+                    Parent = wrapper,
+                }, {
+                    create("UICorner", { CornerRadius = UDim.new(0, 8) }),
+                })
+                local stroke = create("UIStroke", {
+                    Color = Theme.Border,
+                    Thickness = 1,
+                    Transparency = 0.55,
+                    Parent = holder,
+                })
+
+                local topBtn = create("TextButton", {
+                    Size = UDim2.new(1, 0, 0, 38),
+                    BackgroundTransparency = 1,
+                    Text = "",
+                    AutoButtonColor = false,
+                    ZIndex = 18,
+                    Parent = holder,
+                })
+
+                create("TextLabel", {
+                    Position = UDim2.new(0, 12, 0, 0),
+                    Size = UDim2.new(0.5, -12, 0, 38),
+                    BackgroundTransparency = 1,
+                    Text = label,
+                    TextColor3 = Theme.TextPrimary,
+                    TextSize = 12,
+                    FontFace = FontFace.Body,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    ZIndex = 18,
+                    Parent = topBtn,
+                })
+
+                local valueLbl = create("TextLabel", {
+                    AnchorPoint = Vector2.new(1, 0),
+                    Position = UDim2.new(1, -28, 0, 0),
+                    Size = UDim2.new(0.48, -12, 0, 38),
+                    BackgroundTransparency = 1,
+                    Text = "None",
+                    TextColor3 = Theme.TextSecondary,
+                    TextSize = 11,
+                    FontFace = FontFace.Mono,
+                    TextTruncate = Enum.TextTruncate.AtEnd,
+                    TextXAlignment = Enum.TextXAlignment.Right,
+                    ZIndex = 18,
+                    Parent = topBtn,
+                })
+
+                local chevron = create("TextLabel", {
+                    AnchorPoint = Vector2.new(1, 0.5),
+                    Position = UDim2.new(1, -10, 0.5, 0),
+                    Size = UDim2.fromOffset(14, 14),
+                    BackgroundTransparency = 1,
+                    Text = "v",
+                    TextColor3 = Theme.TextMuted,
+                    TextSize = 10,
+                    FontFace = FontFace.Mono,
+                    ZIndex = 18,
+                    Parent = topBtn,
+                })
+
+                local listFrame = create("Frame", {
+                    Position = UDim2.fromOffset(8, 40),
+                    Size = UDim2.new(1, -16, 0, 0),
+                    AutomaticSize = Enum.AutomaticSize.Y,
+                    BackgroundTransparency = 1,
+                    ZIndex = 18,
+                    Parent = holder,
+                }, {
+                    create("UIListLayout", { Padding = UDim.new(0, 4) }),
+                    create("UIPadding", { PaddingBottom = UDim.new(0, 8) }),
+                })
+
+                local open = false
+                local obj = {}
+
+                local function renderSummary()
+                    if multi then
+                        local active = {}
+                        for _, item in ipairs(items) do
+                            if selected[item] then
+                                table.insert(active, tostring(item))
+                            end
+                        end
+                        valueLbl.Text = (#active > 0) and table.concat(active, ", ") or "None"
+                    else
+                        valueLbl.Text = selected ~= nil and tostring(selected) or "None"
+                    end
+                    if flag then Velour.Flags[flag] = selected end
+                end
+
+                local function setOpen(state)
+                    open = state
+                    local targetHeight = 38
+                    if open then
+                        targetHeight = 48 + #items * 30
+                    end
+                    tween(holder, 0.22, { Size = UDim2.new(1, 0, 0, targetHeight) })
+                    tween(chevron, 0.2, { Rotation = open and 180 or 0 })
+                    tween(stroke, 0.2, {
+                        Color = open and Theme.BorderFocus or Theme.Border,
+                        Transparency = open and 0.25 or 0.55,
+                    })
+                end
+
+                function obj:Refresh(newItems)
+                    items = newItems or {}
+                    for _, child in ipairs(listFrame:GetChildren()) do
+                        if child:IsA("TextButton") then
+                            child:Destroy()
+                        end
+                    end
+                    for _, item in ipairs(items) do
+                        local isSel = multi and selected[item] or (selected == item)
+                        local opt = create("TextButton", {
+                            Size = UDim2.new(1, 0, 0, 26),
+                            BackgroundColor3 = isSel and Theme.Oxblood or Theme.SurfaceRaised,
+                            BackgroundTransparency = isSel and 0.2 or 0.45,
+                            Text = "  " .. tostring(item),
+                            TextColor3 = isSel and Theme.TextPrimary or Theme.TextSecondary,
+                            TextSize = 11,
+                            FontFace = FontFace.Body,
+                            TextXAlignment = Enum.TextXAlignment.Left,
+                            AutoButtonColor = false,
+                            ZIndex = 19,
+                            Parent = listFrame,
+                        }, {
+                            create("UICorner", { CornerRadius = UDim.new(0, 6) }),
+                        })
+
+                        opt.MouseButton1Click:Connect(function()
+                            if multi then
+                                selected[item] = not selected[item]
+                                local active = selected[item]
+                                tween(opt, 0.14, {
+                                    BackgroundColor3 = active and Theme.Oxblood or Theme.SurfaceRaised,
+                                    BackgroundTransparency = active and 0.2 or 0.45,
+                                    TextColor3 = active and Theme.TextPrimary or Theme.TextSecondary,
+                                })
+                                renderSummary()
+                                if callback then task.spawn(callback, selected) end
+                            else
+                                selected = item
+                                renderSummary()
+                                obj:Refresh(items)
+                                setOpen(false)
+                                if callback then task.spawn(callback, selected) end
+                            end
+                            silk:TriggerPulse(opt.AbsolutePosition + opt.AbsoluteSize * 0.5, 0.55)
+                        end)
+                    end
+                    if open then setOpen(true) end
+                end
+
+                function obj:Set(val, silent)
+                    selected = val
+                    renderSummary()
+                    obj:Refresh(items)
+                    if not silent and callback then
+                        task.spawn(callback, selected)
+                    end
+                end
+
+                function obj:Get()
+                    return selected
+                end
+
+                topBtn.MouseButton1Click:Connect(function()
+                    setOpen(not open)
+                    silk:TriggerPulse(topBtn.AbsolutePosition + topBtn.AbsoluteSize * 0.5, 0.55)
+                end)
+
+                renderSummary()
+                obj:Refresh(items)
+                return obj
+            end
+
+            --------------------------------------------------------------------
+            -- Control: Text Input
+            --------------------------------------------------------------------
+
+            function section:AddInput(cfg)
+                cfg = cfg or {}
+                local label = cfg.Title or "Input"
+                local placeholder = cfg.Placeholder or "Type here..."
+                local numeric = cfg.Numeric == true
+                local flag = cfg.Flag
+                local callback = cfg.Callback
+
+                local row, stroke = makeRow(40)
+
+                create("TextLabel", {
+                    Position = UDim2.new(0, 12, 0, 0),
+                    Size = UDim2.new(0.48, -12, 1, 0),
+                    BackgroundTransparency = 1,
+                    Text = label,
+                    TextColor3 = Theme.TextPrimary,
+                    TextSize = 12,
+                    FontFace = FontFace.Body,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    ZIndex = 18,
+                    Parent = row,
+                })
+
+                local box = create("TextBox", {
+                    AnchorPoint = Vector2.new(1, 0.5),
+                    Position = UDim2.new(1, -10, 0.5, 0),
+                    Size = UDim2.new(0.48, 0, 0, 26),
+                    BackgroundColor3 = Theme.Obsidian,
+                    BackgroundTransparency = 0.25,
+                    Text = cfg.Default or "",
+                    PlaceholderText = placeholder,
+                    PlaceholderColor3 = Theme.TextMuted,
+                    TextColor3 = Theme.TextPrimary,
+                    TextSize = 11,
+                    FontFace = FontFace.Mono,
+                    ClearTextOnFocus = false,
+                    ZIndex = 19,
+                    Parent = row,
+                }, {
+                    create("UICorner", { CornerRadius = UDim.new(0, 6) }),
+                    create("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }),
+                })
+                local boxStroke = create("UIStroke", {
+                    Color = Theme.Border,
+                    Thickness = 1,
+                    Transparency = 0.35,
+                    Parent = box,
+                })
+
+                box.Focused:Connect(function()
+                    tween(boxStroke, 0.16, { Color = Theme.BorderFocus, Transparency = 0.1 })
+                    tween(stroke, 0.16, { Color = Theme.BorderFocus, Transparency = 0.3 })
+                end)
+
+                box.FocusLost:Connect(function(enterPressed)
+                    tween(boxStroke, 0.16, { Color = Theme.Border, Transparency = 0.35 })
+                    tween(stroke, 0.16, { Color = Theme.Border, Transparency = 0.55 })
+                    local val = box.Text
+                    if numeric then
+                        val = tonumber(val) or 0
+                        box.Text = tostring(val)
+                    end
+                    if flag then Velour.Flags[flag] = val end
+                    if callback then
+                        task.spawn(callback, val, enterPressed)
+                    end
+                end)
+
+                return {
+                    Set = function(_, v)
+                        box.Text = tostring(v)
+                        if flag then Velour.Flags[flag] = v end
+                    end,
+                    Get = function()
+                        return numeric and (tonumber(box.Text) or 0) or box.Text
+                    end,
+                }
+            end
+
+            --------------------------------------------------------------------
+            -- Control: Keybind
+            --------------------------------------------------------------------
+
+            function section:AddKeybind(cfg)
+                cfg = cfg or {}
+                local label = cfg.Title or "Keybind"
+                local key = cfg.Default or Enum.KeyCode.F
+                local flag = cfg.Flag
+                local callback = cfg.Callback
+
+                local row, _ = makeRow(38)
+                create("TextLabel", {
+                    Position = UDim2.new(0, 12, 0, 0),
+                    Size = UDim2.new(1, -110, 1, 0),
+                    BackgroundTransparency = 1,
+                    Text = label,
+                    TextColor3 = Theme.TextPrimary,
+                    TextSize = 12,
+                    FontFace = FontFace.Body,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    ZIndex = 18,
+                    Parent = row,
+                })
+
+                local keyBtn = create("TextButton", {
+                    AnchorPoint = Vector2.new(1, 0.5),
+                    Position = UDim2.new(1, -10, 0.5, 0),
+                    Size = UDim2.fromOffset(78, 24),
+                    BackgroundColor3 = Theme.SurfaceRaised,
+                    Text = key.Name,
+                    TextColor3 = Theme.SilkGlint,
+                    TextSize = 11,
+                    FontFace = FontFace.Mono,
+                    AutoButtonColor = false,
+                    ZIndex = 19,
+                    Parent = row,
+                }, {
+                    create("UICorner", { CornerRadius = UDim.new(0, 6) }),
+                    create("UIStroke", { Color = Theme.Border, Thickness = 1, Transparency = 0.3 }),
+                })
+
+                local listening = false
+                if flag then Velour.Flags[flag] = key end
+
+                keyBtn.MouseButton1Click:Connect(function()
+                    listening = true
+                    keyBtn.Text = "..."
+                    silk:TriggerPulse(keyBtn.AbsolutePosition + keyBtn.AbsoluteSize * 0.5, 0.6)
+                end)
+
+                maid:Give(UserInputService.InputBegan:Connect(function(input, gp)
+                    if listening then
+                        if input.UserInputType == Enum.UserInputType.Keyboard then
+                            listening = false
+                            key = input.KeyCode
+                            keyBtn.Text = key.Name
+                            if flag then Velour.Flags[flag] = key end
+                        end
+                    elseif not gp and input.KeyCode == key then
+                        if callback then task.spawn(callback, key) end
+                    end
+                end))
+
+                return {
+                    Set = function(_, newKey)
+                        key = newKey
+                        keyBtn.Text = key.Name
+                        if flag then Velour.Flags[flag] = key end
+                    end,
+                    Get = function()
+                        return key
+                    end,
+                }
+            end
+
+            --------------------------------------------------------------------
+            -- Control: Paragraph / Info Block
+            --------------------------------------------------------------------
+
+            function section:AddParagraph(cfg)
+                cfg = cfg or {}
+                local pTitle = cfg.Title or ""
+                local pBody = cfg.Content or ""
+
+                local box = create("Frame", {
+                    Size = UDim2.new(1, 0, 0, 0),
+                    AutomaticSize = Enum.AutomaticSize.Y,
+                    BackgroundColor3 = Theme.Obsidian,
+                    BackgroundTransparency = 0.38,
+                    BorderSizePixel = 0,
+                    LayoutOrder = nextOrder(),
+                    ZIndex = 17,
+                    Parent = wrapper,
+                }, {
+                    create("UICorner", { CornerRadius = UDim.new(0, 8) }),
+                    create("UIStroke", { Color = Theme.Border, Thickness = 1, Transparency = 0.6 }),
+                    create("UIPadding", {
+                        PaddingTop = UDim.new(0, 8),
+                        PaddingBottom = UDim.new(0, 8),
+                        PaddingLeft = UDim.new(0, 12),
+                        PaddingRight = UDim.new(0, 12),
+                    }),
+                    create("UIListLayout", { Padding = UDim.new(0, 3) }),
+                })
+
+                local titleLbl = create("TextLabel", {
+                    Size = UDim2.new(1, 0, 0, 16),
+                    BackgroundTransparency = 1,
+                    Text = pTitle,
+                    TextColor3 = Theme.TextPrimary,
+                    TextSize = 12,
+                    FontFace = FontFace.Semi,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    ZIndex = 18,
+                    Parent = box,
+                })
+
+                local bodyLbl = create("TextLabel", {
+                    Size = UDim2.new(1, 0, 0, 0),
+                    AutomaticSize = Enum.AutomaticSize.Y,
+                    BackgroundTransparency = 1,
+                    Text = pBody,
+                    TextColor3 = Theme.TextSecondary,
+                    TextSize = 11,
+                    FontFace = FontFace.Body,
+                    TextWrapped = true,
+                    TextXAlignment = Enum.TextXAlignment.Left,
+                    ZIndex = 18,
+                    Parent = box,
+                })
+
+                return {
+                    SetTitle = function(_, s) titleLbl.Text = s end,
+                    SetContent = function(_, s) bodyLbl.Text = s end,
+                }
+            end
+
+            return section
+        end
+
+        return tab
+    end
+
+    return window
+end
+
+--------------------------------------------------------------------------------
+-- Config Serialization Helpers
+--------------------------------------------------------------------------------
+
+function Velour:ExportConfig()
+    local clean = {}
+    for k, v in pairs(self.Flags) do
+        local t = typeof(v)
+        if t == "boolean" or t == "number" or t == "string" or t == "table" then
+            clean[k] = v
+        elseif t == "EnumItem" then
+            clean[k] = v.Name
+        end
+    end
+    return HttpService:JSONEncode(clean)
+end
+
+--------------------------------------------------------------------------------
+-- Live Preview Demo (set SHOW_DEMO = false when embedding via loadstring)
+--------------------------------------------------------------------------------
+
+local SHOW_DEMO = true
+
+if SHOW_DEMO then
+    local Window = Velour:CreateWindow({
+        Title = "VELOUR",
+        Subtitle = "CRIMSON SILK ARCHITECTURE",
+        ToggleKey = Enum.KeyCode.RightShift,
+        Size = UDim2.fromOffset(600, 410),
+    })
+
+    local MainTab = Window:AddTab("Overview")
+    local MotionTab = Window:AddTab("Kinematics")
+    local SystemTab = Window:AddTab("System")
+
+    local CoreSec = MainTab:AddSection("Silk Surface & Controls")
+    CoreSec:AddParagraph({
+        Title = "Procedural Silk Engine",
+        Content = "Move across the panel or tap any control to bend the crimson-black silk folds and dispatch Gaussian ripple waves.",
+    })
+
+    CoreSec:AddToggle({
+        Title = "Adaptive Silk Sheen",
+        Description = "Reacts to pointer proximity and click ripples",
+        Flag = "AdaptiveSheen",
+        Default = true,
+        Callback = function(state)
+            Window:Notify({
+                Title = "Adaptive Silk Sheen",
+                Content = state and "Enabled" or "Disabled",
+                Duration = 2.2,
+            })
+        end,
+    })
+
+    CoreSec:AddSlider({
+        Title = "Movement Velocity",
+        Min = 16,
+        Max = 120,
+        Default = 33,
+        Increment = 1,
+        Suffix = " st/s",
+        Flag = "WalkSpeed",
+        Callback = function(val)
+            local char = LocalPlayer.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if hum then
+                hum.WalkSpeed = val
+            end
+        end,
+    })
+
+    CoreSec:AddDropdown({
+        Title = "Render Profile",
+        Values = { "Velvet Obsidian", "Deep Crimson", "High Contrast" },
+        Default = "Velvet Obsidian",
+        Flag = "Profile",
+        Callback = function(choice)
+            Window:Notify({
+                Title = "Profile Switched",
+                Content = "Active preset: " .. tostring(choice),
+                Duration = 2.4,
+            })
+        end,
+    })
+
+    local MoveSec = MotionTab:AddSection("Character Tuning")
+    MoveSec:AddSlider({
+        Title = "Jump Impulse",
+        Min = 50,
+        Max = 150,
+        Default = 54,
+        Increment = 1,
+        Suffix = " jp",
+        Flag = "JumpPower",
+        Callback = function(val)
+            local char = LocalPlayer.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if hum then
+                hum.UseJumpPower = true
+                hum.JumpPower = val
+            end
+        end,
+    })
+
+    MoveSec:AddButton({
+        Title = "Dispatch Silk Ripple",
+        Description = "Trigger a centered crimson crease wave manually",
+        Badge = "RUN",
+        Callback = function()
+            Window.Silk:TriggerPulse(Window.Main.AbsolutePosition + Window.Main.AbsoluteSize * 0.5, 1.0)
+        end,
+    })
+
+    local SysSec = SystemTab:AddSection("Configuration")
+    SysSec:AddInput({
+        Title = "Session Label",
+        Placeholder = "Enter label...",
+        Flag = "SessionLabel",
+    })
+    SysSec:AddKeybind({
+        Title = "Quick Action Bind",
+        Default = Enum.KeyCode.G,
+        Flag = "QuickBind",
+        Callback = function()
+            Window:Notify({ Title = "Keybind", Content = "Quick action triggered", Duration = 2 })
+        end,
+    })
+    SysSec:AddButton({
+        Title = "Unload Interface",
+        Description = "Cleanly disconnects RenderStepped loops and removes UI",
+        Badge = "EXIT",
+        Callback = function()
+            Window:Destroy()
+        end,
+    })
+end
+
+return Velour
